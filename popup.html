@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <span class="title">视频倍速控制</span>
+      <label class="switch" title="启用/停用快捷键">
+        <input type="checkbox" id="enabled" />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="speed-box">
+      <div class="cur">当前速度 <b id="curRate">—</b></div>
+      <div class="presets">
+        <button data-rate="0.5">0.5x</button>
+        <button data-rate="1">1x</button>
+        <button data-rate="1.25">1.25x</button>
+        <button data-rate="1.5">1.5x</button>
+        <button data-rate="2">2x</button>
+        <button data-rate="3">3x</button>
+      </div>
+      <div class="fine">
+        <button id="minus">−</button>
+        <input type="number" id="rateInput" step="0.25" min="0.1" max="16" />
+        <button id="plus">+</button>
+      </div>
+    </section>
+
+    <section class="opts">
+      <h3>参数</h3>
+      <div class="row">
+        <label>步长</label>
+        <input type="number" id="step" step="0.05" min="0.05" max="2" />
+      </div>
+      <div class="row">
+        <label>一键倍速目标</label>
+        <input type="number" id="fastSpeed" step="0.25" min="0.25" max="16" />
+      </div>
+      <div class="row">
+        <label>快进/退秒数</label>
+        <input type="number" id="seekStep" step="1" min="1" max="120" />
+      </div>
+      <div class="row">
+        <label>记住上次速度</label>
+        <input type="checkbox" id="rememberSpeed" />
+      </div>
+      <div class="row">
+        <label>显示速度提示</label>
+        <input type="checkbox" id="showIndicator" />
+      </div>
+    </section>
+
+    <section class="keys">
+      <h3>快捷键 <span class="hint">点输入框后按键设置</span></h3>
+      <div class="krow"><label>加速</label><input data-key="faster" readonly /></div>
+      <div class="krow"><label>减速</label><input data-key="slower" readonly /></div>
+      <div class="krow"><label>恢复 1x</label><input data-key="reset" readonly /></div>
+      <div class="krow"><label>一键倍速</label><input data-key="toggleFast" readonly /></div>
+      <div class="krow"><label>快退</label><input data-key="rewind" readonly /></div>
+      <div class="krow"><label>快进</label><input data-key="forward" readonly /></div>
+      <div class="krow"><label>显示/隐藏</label><input data-key="display" readonly /></div>
+    </section>
+
+    <footer>
+      <div class="io">
+        <button id="export" class="ghost2">导出配置</button>
+        <button id="import" class="ghost2">导入配置</button>
+        <input type="file" id="importFile" accept="application/json,.json" hidden />
+      </div>
+      <div id="status" class="status"></div>
+      <button id="reset" class="ghost">恢复默认设置</button>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
