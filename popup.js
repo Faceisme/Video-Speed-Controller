@@ -2,8 +2,8 @@
 
 const DEFAULTS = {
   enabled: true,
-  step: 0.25,
-  fastSpeed: 2.0,
+  step: 2,
+  fastSpeed: 4,
   seekStep: 5,
   minSpeed: 0.1,
   maxSpeed: 16,
@@ -12,9 +12,9 @@ const DEFAULTS = {
   keys: {
     faster: "KeyD",
     slower: "KeyS",
-    reset: "KeyR",
+    reset: "KeyZ",
     toggleFast: "KeyA",
-    rewind: "KeyZ",
+    rewind: "KeyR",
     forward: "KeyX",
     display: "KeyV"
   }
@@ -206,8 +206,8 @@ function bind() {
   $("enabled").addEventListener("change", (e) => { settings.enabled = e.target.checked; save(); });
   $("rememberSpeed").addEventListener("change", (e) => { settings.rememberSpeed = e.target.checked; save(); });
   $("showIndicator").addEventListener("change", (e) => { settings.showIndicator = e.target.checked; save(); });
-  $("step").addEventListener("change", (e) => { settings.step = parseFloat(e.target.value) || 0.25; save(); });
-  $("fastSpeed").addEventListener("change", (e) => { settings.fastSpeed = parseFloat(e.target.value) || 2; save(); });
+  $("step").addEventListener("change", (e) => { settings.step = parseFloat(e.target.value) || 2; save(); });
+  $("fastSpeed").addEventListener("change", (e) => { settings.fastSpeed = parseFloat(e.target.value) || 4; save(); });
   $("seekStep").addEventListener("change", (e) => { settings.seekStep = parseInt(e.target.value) || 5; save(); });
 
   // 快捷键录入

@@ -14,8 +14,8 @@
 
   const DEFAULTS = {
     enabled: true,
-    step: 0.25,        // 加/减速步长
-    fastSpeed: 2.0,    // 一键倍速的目标速度
+    step: 2,           // 加/减速步长
+    fastSpeed: 4,      // 一键倍速的目标速度
     seekStep: 5,       // 快进/快退秒数
     minSpeed: 0.1,
     maxSpeed: 16,
@@ -24,9 +24,9 @@
     keys: {
       faster: "KeyD",
       slower: "KeyS",
-      reset: "KeyR",
+      reset: "KeyZ",
       toggleFast: "KeyA",
-      rewind: "KeyZ",
+      rewind: "KeyR",
       forward: "KeyX",
       display: "KeyV"
     }
