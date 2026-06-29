@@ -21,6 +21,8 @@
     maxSpeed: 16,
     rememberSpeed: false, // 记住上次速度并自动套用到新视频
     showIndicator: true,
+    autoMute: true,                  // 命中下面的域名时自动静音
+    autoMuteHosts: ["115vod.com"],   // 需要自动静音的域名(支持子域)
     keys: {
       faster: "KeyD",
       slower: "KeyS",
@@ -38,6 +40,9 @@
 
   const media = new Set();       // 本 frame 内已发现的媒体元素
   const forced = new WeakSet();  // 已挂上"强制保持"监听的元素
+  const muteHooked = new WeakSet(); // 已挂上"自动静音"监听的元素
+  const mutedByUs = new WeakSet();  // 由本扩展静音的元素(便于取消时还原)
+  let autoMuteActive = false;    // 本 frame 是否命中自动静音域名
 
   /* ------------------------- 工具 ------------------------- */
   const clamp = (v) => Math.min(settings.maxSpeed, Math.max(settings.minSpeed, v));
@@ -51,6 +56,58 @@
     return false;
   }
 
+  /* ------------------------- 自动静音 -------------------------
+   * 命中配置域名的页面里所有视频自动静音并强制保持。
+   * 视频常嵌在跨域 iframe 里,所以除本 frame 域名外,
+   * 还会用 location.ancestorOrigins 检查祖先 frame 的域名。
+   */
+  function hostMatches(host, pattern) {
+    if (!host || !pattern) return false;
+    host = String(host).toLowerCase();
+    pattern = String(pattern).trim().toLowerCase().replace(/^\*\./, "");
+    if (!pattern) return false;
+    return host === pattern || host.endsWith("." + pattern);
+  }
+
+  function autoMuteShouldApply() {
+    if (!settings.autoMute) return false;
+    const list = settings.autoMuteHosts || [];
+    if (!list.length) return false;
+    const hosts = [];
+    try { if (location.hostname) hosts.push(location.hostname); } catch (_) {}
+    try {
+      const ao = location.ancestorOrigins;
+      if (ao) for (let i = 0; i < ao.length; i++) {
+        try { hosts.push(new URL(ao[i]).hostname); } catch (_) {}
+      }
+    } catch (_) {}
+    return hosts.some((h) => list.some((p) => hostMatches(h, p)));
+  }
+
+  function muteEl(el) {
+    try {
+      if (!el.muted) el.muted = true;
+      mutedByUs.add(el);
+    } catch (_) {}
+  }
+
+  function refreshAutoMute() {
+    const want = autoMuteShouldApply();
+    if (want) {
+      autoMuteActive = true;
+      media.forEach(muteEl);
+    } else if (autoMuteActive) {
+      // 取消自动静音:仅还原由本扩展静音过的元素
+      autoMuteActive = false;
+      media.forEach((el) => {
+        if (mutedByUs.has(el)) {
+          try { el.muted = false; } catch (_) {}
+          mutedByUs.delete(el);
+        }
+      });
+    }
+  }
+
   /* ------------------------- 设置加载 -------------------------
    * 配置项(vsc_settings)走 chrome.storage.sync 跨设备同步;
    * 易变的"上次速度"(vsc_lastSpeed)走 local,避免触发 sync 写入配额。
@@ -60,6 +117,7 @@
       settings = Object.assign({}, DEFAULTS, data);
       settings.keys = Object.assign({}, DEFAULTS.keys, data.keys || {});
     }
+    refreshAutoMute();
     maybeApplyRemembered();
   }
 
@@ -93,6 +151,7 @@
         const v = changes.vsc_settings.newValue || {};
         settings = Object.assign({}, DEFAULTS, v);
         settings.keys = Object.assign({}, DEFAULTS.keys, v.keys || {});
+        refreshAutoMute();
       }
     });
   } catch (_) {}
@@ -126,6 +185,15 @@
         }
       });
     }
+
+    // 自动静音:命中域名时静音,并在被取消静音/播放时强制复位
+    if (!muteHooked.has(el)) {
+      muteHooked.add(el);
+      const enforceMute = () => { if (autoMuteActive && !el.muted) muteEl(el); };
+      el.addEventListener("volumechange", enforceMute);
+      el.addEventListener("play", enforceMute, true);
+    }
+    if (autoMuteActive) muteEl(el);
   }
 
   function scan(root) {
@@ -356,6 +424,7 @@
   document.addEventListener("webkitfullscreenchange", () => { if (indicatorEl) positionIndicator(); });
 
   /* ------------------------- 启动 ------------------------- */
+  refreshAutoMute(); // 先用默认配置判定,缩短"有声"窗口;storage 读完后再校正
   loadSettings();
   startObserver();
   if (document.readyState === "loading") {

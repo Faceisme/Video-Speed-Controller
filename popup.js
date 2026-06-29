@@ -9,6 +9,8 @@ const DEFAULTS = {
   maxSpeed: 16,
   rememberSpeed: false,
   showIndicator: true,
+  autoMute: true,
+  autoMuteHosts: ["115vod.com"],
   keys: {
     faster: "KeyD",
     slower: "KeyS",
@@ -182,6 +184,8 @@ function render() {
   $("seekStep").value = settings.seekStep;
   $("rememberSpeed").checked = settings.rememberSpeed;
   $("showIndicator").checked = settings.showIndicator;
+  $("autoMute").checked = settings.autoMute;
+  $("autoMuteHosts").value = (settings.autoMuteHosts || []).join("\n");
   document.querySelectorAll("[data-key]").forEach((inp) => {
     inp.value = codeLabel(settings.keys[inp.dataset.key]);
     inp.dataset.code = settings.keys[inp.dataset.key];
@@ -206,6 +210,14 @@ function bind() {
   $("enabled").addEventListener("change", (e) => { settings.enabled = e.target.checked; save(); });
   $("rememberSpeed").addEventListener("change", (e) => { settings.rememberSpeed = e.target.checked; save(); });
   $("showIndicator").addEventListener("change", (e) => { settings.showIndicator = e.target.checked; save(); });
+  $("autoMute").addEventListener("change", (e) => { settings.autoMute = e.target.checked; save(); });
+  $("autoMuteHosts").addEventListener("change", (e) => {
+    settings.autoMuteHosts = e.target.value
+      .split(/[\s,，]+/)              // 换行 / 空格 / 中英文逗号分隔
+      .map((s) => s.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, ""))
+      .filter(Boolean);
+    save();
+  });
   $("step").addEventListener("change", (e) => { settings.step = parseFloat(e.target.value) || 2; save(); });
   $("fastSpeed").addEventListener("change", (e) => { settings.fastSpeed = parseFloat(e.target.value) || 4; save(); });
   $("seekStep").addEventListener("change", (e) => { settings.seekStep = parseInt(e.target.value) || 5; save(); });
