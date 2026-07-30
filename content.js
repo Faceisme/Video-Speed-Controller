@@ -48,6 +48,25 @@
   const clamp = (v) => Math.min(settings.maxSpeed, Math.max(settings.minSpeed, v));
   const round2 = (v) => Math.round(v * 100) / 100;
 
+  /* 同时写 playbackRate 和 defaultPlaybackRate。
+   * 站点换 src / 调 load() 时会走"媒体加载算法",把 playbackRate 静默重置成
+   * defaultPlaybackRate 且不触发 ratechange —— 只改 playbackRate 会被无声吃掉
+   * (DMM 预览视频就是这种:点播放才赋 src,速度提示显示了但实际按 1x 播)。
+   * 带阈值判断,避免自己触发的 ratechange 造成回环。 */
+  function setRate(el, rate) {
+    try {
+      if (Math.abs(el.defaultPlaybackRate - rate) > 0.005) el.defaultPlaybackRate = rate;
+      if (Math.abs(el.playbackRate - rate) > 0.005) el.playbackRate = rate;
+    } catch (_) {}
+  }
+
+  // 对单个元素重新施加当前的速度/静音状态。
+  // 目标是 1.0 时不主动写入,免得跟站点自带的倍速菜单打架。
+  function enforce(el) {
+    if (targetRate !== 1.0) setRate(el, targetRate);
+    if (autoMuteActive) muteEl(el);
+  }
+
   function isTypingTarget(el) {
     if (!el) return false;
     const tag = el.tagName;
@@ -106,6 +125,7 @@
         }
       });
     }
+    syncWatchdog();
   }
 
   /* ------------------------- 设置加载 -------------------------
@@ -167,21 +187,21 @@
 
   /* ------------------------- 媒体发现 ------------------------- */
   function register(el) {
-    if (!el || media.has(el)) return;
+    if (!el) return;
     if (el.tagName !== "VIDEO" && el.tagName !== "AUDIO") return;
+    // 已登记过的元素也要重新施加一次:play/canplay 等事件正是站点刚换完 src 的时机
+    if (media.has(el)) { enforce(el); return; }
     media.add(el);
 
     // 套用当前目标速度
-    if (targetRate !== 1.0) {
-      try { el.playbackRate = targetRate; } catch (_) {}
-    }
+    enforce(el);
 
     // 强制保持:站点把速度改回去时复位
     if (!forced.has(el)) {
       forced.add(el);
       el.addEventListener("ratechange", () => {
         if (targetRate !== 1.0 && Math.abs(el.playbackRate - targetRate) > 0.01) {
-          try { el.playbackRate = targetRate; } catch (_) {}
+          setRate(el, targetRate);
         }
       });
     }
@@ -193,7 +213,6 @@
       el.addEventListener("volumechange", enforceMute);
       el.addEventListener("play", enforceMute, true);
     }
-    if (autoMuteActive) muteEl(el);
   }
 
   function scan(root) {
@@ -201,16 +220,22 @@
     let list;
     try { list = root.querySelectorAll("video, audio"); } catch (_) { return; }
     list.forEach(register);
-    // 遍历 shadow DOM
+    // 遍历 shadow DOM。媒体事件不是 composed 的,跨不出 shadow 边界,
+    // 所以这里除了扫描还要给每个 shadow root 单独挂 MutationObserver。
     let all;
     try { all = root.querySelectorAll("*"); } catch (_) { return; }
     for (const el of all) {
-      if (el.shadowRoot) scan(el.shadowRoot);
+      if (el.shadowRoot) { observeRoot(el.shadowRoot); scan(el.shadowRoot); }
     }
   }
 
-  // 捕获 play/loadeddata:动态创建的媒体一旦活动就能抓到(最可靠)
-  ["play", "loadeddata", "canplay", "loadedmetadata"].forEach((evt) => {
+  /* 捕获媒体生命周期事件:动态创建的媒体一旦活动就能抓到(最可靠)。
+   * loadstart/loadedmetadata 尤其关键 —— 站点换 src 时 playbackRate 已被
+   * 静默清成 1.0,必须在这些时机重新写回去。 */
+  [
+    "loadstart", "loadedmetadata", "loadeddata", "canplay",
+    "play", "playing", "seeked", "durationchange", "ratechange"
+  ].forEach((evt) => {
     document.addEventListener(evt, (e) => {
       const t = e.target;
       if (t && (t.tagName === "VIDEO" || t.tagName === "AUDIO")) register(t);
@@ -227,16 +252,40 @@
       }
     }
   });
+  const observedRoots = new WeakSet();
+  function observeRoot(root) {
+    if (!root || observedRoots.has(root)) return;
+    observedRoots.add(root);
+    try { mo.observe(root, { childList: true, subtree: true }); } catch (_) {}
+  }
   function startObserver() {
-    if (document.documentElement) {
-      mo.observe(document.documentElement, { childList: true, subtree: true });
+    if (document.documentElement) observeRoot(document.documentElement);
+  }
+
+  /* 兜底轮询:有些播放器既不发 ratechange 也不发可捕获的事件就把速度清掉
+   * (换 src、切清晰度、重建 <video>)。仅在需要保持非 1x 或自动静音时运行。 */
+  let watchdogTimer = 0;
+  function syncWatchdog() {
+    const need = targetRate !== 1.0 || autoMuteActive;
+    if (need && !watchdogTimer) {
+      watchdogTimer = setInterval(() => {
+        media.forEach((el) => {
+          if (!el.isConnected) { media.delete(el); return; } // 已卸载,重新插入时会被再次登记
+          enforce(el);
+        });
+      }, 250);
+    } else if (!need && watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = 0;
     }
   }
 
   /* ------------------------- 速度 / 跳转 ------------------------- */
   function applyLocal(rate, showUI = true) {
     targetRate = clamp(round2(rate));
-    media.forEach((m) => { try { m.playbackRate = targetRate; } catch (_) {} });
+    // 用户显式操作,即使目标是 1.0 也直接写(顺带把 defaultPlaybackRate 复位)
+    media.forEach((m) => setRate(m, targetRate));
+    syncWatchdog();
     if (showUI) showIndicator();
     persistLastSpeed(targetRate);
   }
@@ -256,11 +305,13 @@
   }
 
   /* ------------------------- iframe 中继 ------------------------- */
+  // 直接遍历子浏览上下文,而不是 querySelectorAll("iframe"):
+  // 后者漏掉 shadow DOM 里的 iframe 和 <frame>
   function broadcast(payload) {
-    const frames = document.querySelectorAll("iframe");
-    frames.forEach((f) => {
-      try { f.contentWindow.postMessage(Object.assign({ __vsc: true }, payload), "*"); } catch (_) {}
-    });
+    const msg = Object.assign({ __vsc: true }, payload);
+    for (let i = 0; i < window.length; i++) {
+      try { window[i].postMessage(msg, "*"); } catch (_) {}
+    }
   }
 
   window.addEventListener("message", (e) => {
@@ -431,6 +482,6 @@
     document.addEventListener("DOMContentLoaded", () => scan(document), { once: true });
   }
   scan(document);
-  // 兜底:延迟再扫一次,catch 晚加载的播放器
-  setTimeout(() => scan(document), 1500);
+  // 兜底:延迟再扫几次,catch 晚加载的播放器和后挂上的 shadow root
+  [500, 1500, 4000].forEach((ms) => setTimeout(() => scan(document), ms));
 })();
