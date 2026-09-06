@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "视频倍速控制 · Video Speed Controller",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "用快捷键控制任意网页视频的播放速度，支持跨域 iframe 嵌入与预览视频。",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": ["<all_urls>"],

@@ -3,7 +3,8 @@
  * - 发现页面里所有 <video>/<audio>(含动态插入、shadow DOM)
  * - 快捷键调整 playbackRate
  * - "强制保持":站点把速度改回 1.0 时自动复位到目标速度
- * - 顶层 frame 的按键会通过 postMessage 中继到所有子 iframe
+ * - 按键在整棵 frame 树内路由(先上送顶层,再由顶层广播到所有子 frame)
+ * - 修复 Chrome 原生控件的"键盘黑洞"(点过进度条后快捷键彻底失灵)
  */
 (() => {
   "use strict";
@@ -34,8 +35,12 @@
     }
   };
 
+  const RESET_GUARD_MS = 10000;  // 显式复位到 1.0 之后,强制保持 1.0 的时长
+
   let settings = Object.assign({}, DEFAULTS);
   let targetRate = 1.0;          // 当前希望保持的速度
+  let resetGuardUntil = 0;       // 用户显式按了"复位"之后的强制窗口(见 enforce)
+  let userTouched = false;       // 本 frame 里用户是否已经显式调过速度
   let pinIndicator = false;      // 是否常驻显示速度
 
   const media = new Set();       // 本 frame 内已发现的媒体元素
@@ -47,6 +52,7 @@
   /* ------------------------- 工具 ------------------------- */
   const clamp = (v) => Math.min(settings.maxSpeed, Math.max(settings.minSpeed, v));
   const round2 = (v) => Math.round(v * 100) / 100;
+  const isMedia = (el) => !!el && (el.tagName === "VIDEO" || el.tagName === "AUDIO");
 
   /* 同时写 playbackRate 和 defaultPlaybackRate。
    * 站点换 src / 调 load() 时会走"媒体加载算法",把 playbackRate 静默重置成
@@ -60,18 +66,42 @@
     } catch (_) {}
   }
 
+  /* 给"用户已经亲手调过速度"的媒体打个标记(属性写在共享 DOM 上,页面里的
+   * 油猴脚本也读得到)。同一个页面上常常还有别的脚本在自动变速,看到这个标记
+   * 就该让位 —— 手动优先。 */
+  function markUserControlled(el, rate) {
+    const v = String(rate);
+    // 值没变就别重写:看门狗每秒跑 4 次,每次 setAttribute 都会产生一条 mutation 记录,
+    // 站点自己的 MutationObserver 会被这个噪音打爆。
+    try { if (el.getAttribute("data-vsc-user") !== v) el.setAttribute("data-vsc-user", v); } catch (_) {}
+  }
+
   // 对单个元素重新施加当前的速度/静音状态。
-  // 目标是 1.0 时不主动写入,免得跟站点自带的倍速菜单打架。
+  // 目标是 1.0 时平时不主动写入,免得跟站点自带的倍速菜单打架;
+  // 但用户刚刚显式按过"复位"的十秒内要强制,否则站点/其它脚本会立刻把它顶回去。
   function enforce(el) {
     if (targetRate !== 1.0) setRate(el, targetRate);
+    else if (Date.now() < resetGuardUntil) setRate(el, 1.0);
+    if (userTouched) markUserControlled(el, targetRate);
     if (autoMuteActive) muteEl(el);
   }
 
+  /* 输入框判定:只有真正能打字的地方才让路。
+   * 原来把所有 <input> 都算成"正在打字",于是播放器用 <input type="range"> 做的
+   * 进度条/音量条一旦拿到焦点,快捷键就全废了 —— 那不是打字,是播放器控件。 */
+  const TEXT_INPUT_EXCLUDE = new Set([
+    "button", "checkbox", "radio", "range", "submit", "reset", "file", "color", "image"
+  ]);
   function isTypingTarget(el) {
     if (!el) return false;
-    const tag = el.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
     if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag === "INPUT") {
+      let t = "text";
+      try { t = String(el.type || "text").toLowerCase(); } catch (_) {}
+      return !TEXT_INPUT_EXCLUDE.has(t);
+    }
     return false;
   }
 
@@ -157,10 +187,7 @@
     try {
       chrome.storage?.local.get("vsc_lastSpeed", (res) => {
         const s = res && res.vsc_lastSpeed;
-        if (s && s !== 1.0) {
-          targetRate = clamp(s);
-          applyLocal(targetRate, false);
-        }
+        if (s && s !== 1.0) applyLocal(clamp(s), false, false);
       });
     } catch (_) {}
   }
@@ -187,11 +214,11 @@
 
   /* ------------------------- 媒体发现 ------------------------- */
   function register(el) {
-    if (!el) return;
-    if (el.tagName !== "VIDEO" && el.tagName !== "AUDIO") return;
+    if (!isMedia(el)) return;
     // 已登记过的元素也要重新施加一次:play/canplay 等事件正是站点刚换完 src 的时机
     if (media.has(el)) { enforce(el); return; }
     media.add(el);
+    startFocusFix();   // 本 frame 有媒体了,开"焦点黑洞"轮询(见下面那段注释)
 
     // 套用当前目标速度
     enforce(el);
@@ -229,6 +256,13 @@
     }
   }
 
+  // 已经从 DOM 上摘掉的元素别再留在集合里(SPA 站点会反复重建播放器)
+  function pruneMedia() {
+    media.forEach((el) => { if (!el.isConnected) media.delete(el); });
+  }
+
+  function rescan() { pruneMedia(); scan(document); }
+
   /* 捕获媒体生命周期事件:动态创建的媒体一旦活动就能抓到(最可靠)。
    * loadstart/loadedmetadata 尤其关键 —— 站点换 src 时 playbackRate 已被
    * 静默清成 1.0,必须在这些时机重新写回去。 */
@@ -237,8 +271,7 @@
     "play", "playing", "seeked", "durationchange", "ratechange"
   ].forEach((evt) => {
     document.addEventListener(evt, (e) => {
-      const t = e.target;
-      if (t && (t.tagName === "VIDEO" || t.tagName === "AUDIO")) register(t);
+      if (isMedia(e.target)) register(e.target);
     }, true);
   });
 
@@ -247,7 +280,7 @@
     for (const m of muts) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        if (node.tagName === "VIDEO" || node.tagName === "AUDIO") register(node);
+        if (isMedia(node)) register(node);
         else if (node.querySelectorAll) scan(node);
       }
     }
@@ -263,36 +296,127 @@
   }
 
   /* 兜底轮询:有些播放器既不发 ratechange 也不发可捕获的事件就把速度清掉
-   * (换 src、切清晰度、重建 <video>)。仅在需要保持非 1x 或自动静音时运行。 */
+   * (换 src、切清晰度、重建 <video>)。仅在需要保持非 1x、自动静音、
+   * 或处于"复位强制窗口"时运行。 */
   let watchdogTimer = 0;
+  function watchdogNeeded() {
+    return targetRate !== 1.0 || autoMuteActive || Date.now() < resetGuardUntil;
+  }
+  function watchdogTick() {
+    if (!watchdogNeeded()) { syncWatchdog(); return; }
+    media.forEach((el) => {
+      if (!el.isConnected) { media.delete(el); return; } // 已卸载,重新插入时会被再次登记
+      enforce(el);
+    });
+  }
   function syncWatchdog() {
-    const need = targetRate !== 1.0 || autoMuteActive;
-    if (need && !watchdogTimer) {
-      watchdogTimer = setInterval(() => {
-        media.forEach((el) => {
-          if (!el.isConnected) { media.delete(el); return; } // 已卸载,重新插入时会被再次登记
-          enforce(el);
-        });
-      }, 250);
-    } else if (!need && watchdogTimer) {
+    if (watchdogNeeded()) {
+      if (!watchdogTimer) watchdogTimer = setInterval(watchdogTick, 250);
+    } else if (watchdogTimer) {
       clearInterval(watchdogTimer);
       watchdogTimer = 0;
     }
   }
 
+  /* ------------------- 原生控件的"键盘黑洞" -------------------
+   * Chrome 自带的 <video controls> 控件条整个活在 UA shadow DOM 里。
+   * 焦点一旦落进去(点进度条、播放键、音量、全屏按钮),这条控件会把键盘和
+   * 鼠标事件全吞在内部:页面上连 window 捕获阶段都收不到任何 keydown ——
+   * 表现就是"在播放的视频上点了一下进度条,倍速快捷键就再也不管用了"。
+   * 页面唯一能收到的信号,是焦点第一次进入时那一个 focusin(target 被重定向
+   * 成 <video> 本身);之后在控件里怎么点都没有任何事件送出来。
+   *
+   * 办法:只要某个媒体元素是 document.activeElement,就定期把焦点重新
+   * focus() 到宿主元素上。焦点从 UA shadow DOM 内部回到 <video>,键盘事件
+   * 立刻恢复,而 <video> 依然是焦点元素 —— 空格/方向键这些原生快捷键也还在。
+   * 焦点没有真正变化时 focus() 不派发任何事件,所以不会和站点的焦点管理打架。
+   *
+   * 注意这里必须是轮询,不能只靠 focusin 触发一次:焦点从 <video> 本身移进
+   * 控件条内部时,页面看到的 activeElement 前后都是同一个 <video>,连
+   * focusin 都不会再发一次。也就是"先点画面再点进度条"这条最常见的路径,
+   * 恰恰是一个事件都收不到的。所以本 frame 一旦发现过媒体元素就把这个
+   * 轮询开起来(每 frame 一个 120ms 定时器,只读一次 activeElement)。
+   */
+  let focusFixTimer = 0;
+  function reclaimFocus() {
+    const el = document.activeElement;
+    if (!isMedia(el)) return;
+    try { el.focus({ preventScroll: true }); } catch (_) {}
+  }
+  function startFocusFix() {
+    if (focusFixTimer) return;
+    focusFixTimer = setInterval(reclaimFocus, 120);
+  }
+  document.addEventListener("focusin", (e) => {
+    if (isMedia(e.target)) { reclaimFocus(); startFocusFix(); }
+  }, true);
+  // 后台标签页里定时器会被浏览器压到 1 秒甚至更慢,切回来时立刻补一次,别让用户干等
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) reclaimFocus(); });
+
+  /* ------------------------- 活动视频 ------------------------- */
+  // 记住鼠标位置:优先把"鼠标底下"的那个视频当成当前视频
+  let mouseX = -1, mouseY = -1;
+  window.addEventListener("mousemove", (e) => {
+    mouseX = e.clientX; mouseY = e.clientY;
+  }, { capture: true, passive: true });
+
+  function fullscreenEl() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  // 选出本 frame 里"最该被当成当前视频"的那个:
+  // 全屏的 > 鼠标底下的 > 正在播的 > 在视口内的 > 面积大的
+  function pickActiveVideo() {
+    const fs = fullscreenEl();
+    let best = null, bestScore = -1;
+    media.forEach((v) => {
+      if (v.tagName !== "VIDEO") return;
+      let rect;
+      try { rect = v.getBoundingClientRect(); } catch (_) { return; }
+      if (rect.width < 2 || rect.height < 2) return;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const inView = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+      const underMouse = mouseX >= 0 &&
+        mouseX >= rect.left && mouseX <= rect.right &&
+        mouseY >= rect.top && mouseY <= rect.bottom;
+      let score = rect.width * rect.height;
+      if (fs && (v === fs || fs.contains(v))) score += 1e15;
+      if (underMouse) score += 1e13;
+      if (!v.paused) score += 1e12;
+      if (inView) score += 1e9;
+      if (score > bestScore) { bestScore = score; best = { v, rect }; }
+    });
+    return best;
+  }
+
   /* ------------------------- 速度 / 跳转 ------------------------- */
-  function applyLocal(rate, showUI = true) {
+  // explicit=true 表示这是用户主动下的指令(键盘/popup),而不是"记住上次速度"之类的自动套用
+  function applyLocal(rate, showUI = true, explicit = true) {
     targetRate = clamp(round2(rate));
+    if (explicit) userTouched = true;
+    if (explicit && targetRate === 1.0) resetGuardUntil = Date.now() + RESET_GUARD_MS;
+    else if (targetRate !== 1.0) resetGuardUntil = 0;
     // 用户显式操作,即使目标是 1.0 也直接写(顺带把 defaultPlaybackRate 复位)
-    media.forEach((m) => setRate(m, targetRate));
+    media.forEach((m) => {
+      setRate(m, targetRate);
+      if (userTouched) markUserControlled(m, targetRate);
+    });
     syncWatchdog();
     if (showUI) showIndicator();
     persistLastSpeed(targetRate);
   }
 
+  /* 只跳转"当前这个"视频。
+   * 原来是本 frame 里所有媒体一起跳 —— 页面上那些悬停预览、广告小视频
+   * 会被一起拖动;而且顶层广播下来时子 frame 还会再跳一次,等于跳了两步。 */
   function seekLocal(delta) {
-    media.forEach((m) => {
-      if (m.tagName !== "VIDEO" && m.tagName !== "AUDIO") return;
+    const targets = [];
+    const best = pickActiveVideo();      // 全屏的 > 鼠标底下的 > 正在播的 > 视口里最大的
+    if (best && !best.v.paused) targets.push(best.v);
+    else media.forEach((m) => { if (!m.paused && m.isConnected) targets.push(m); });
+    if (!targets.length && best) targets.push(best.v);   // 全都暂停着:跳当前这一个
+    if (!targets.length) return;
+    targets.forEach((m) => {
       try {
         if (isFinite(m.duration)) {
           m.currentTime = Math.min(m.duration, Math.max(0, m.currentTime + delta));
@@ -304,58 +428,104 @@
     showIndicator(delta > 0 ? `⏩ +${delta}s` : `⏪ ${delta}s`);
   }
 
-  /* ------------------------- iframe 中继 ------------------------- */
+  function setPinLocal(on) {
+    pinIndicator = !!on;
+    if (pinIndicator) showIndicator();
+    else hideIndicator();
+  }
+
+  /* ------------------------- frame 路由 -------------------------
+   * 键盘事件只会送到"当前有焦点"的那个 frame。原来只往子 frame 广播,
+   * 所以焦点在别的 iframe(广告位、评论框、播放器外壳)里时按键就全丢了 ——
+   * 这也是"鼠标明明指着视频却控制不了"的一大来源。
+   * 现在:本 frame 先立刻响应,然后把指令上送到顶层,由顶层再向整棵 frame 树
+   * 广播下去。每条指令带唯一 id,收到重复 id 只转发不重复执行(否则快进会跳两步)。
+   */
+  const FRAME_TAG = Math.random().toString(36).slice(2);
+  let msgSeq = 0;
+  const seenMsgs = new Set();
+  function newMsgId() { return FRAME_TAG + ":" + (++msgSeq); }
+  function markSeen(id) {
+    if (!id) return false;
+    if (seenMsgs.has(id)) return true;
+    seenMsgs.add(id);
+    if (seenMsgs.size > 400) {
+      const it = seenMsgs.values();
+      for (let i = 0; i < 200; i++) seenMsgs.delete(it.next().value);
+    }
+    return false;
+  }
+
+  function runCommand(d) {
+    if (d.action === "rate") applyLocal(d.value);
+    else if (d.action === "seek") seekLocal(d.value);
+    else if (d.action === "pin") setPinLocal(d.value);
+  }
+
   // 直接遍历子浏览上下文,而不是 querySelectorAll("iframe"):
   // 后者漏掉 shadow DOM 里的 iframe 和 <frame>
-  function broadcast(payload) {
-    const msg = Object.assign({ __vsc: true }, payload);
+  function sendDown(d) {
+    const msg = Object.assign({}, d, { __vsc: true, dir: "down" });
     for (let i = 0; i < window.length; i++) {
       try { window[i].postMessage(msg, "*"); } catch (_) {}
     }
+  }
+  function sendUp(d) {
+    if (window.top === window) { sendDown(d); return; }
+    try { window.parent.postMessage(Object.assign({}, d, { __vsc: true, dir: "up" }), "*"); }
+    catch (_) {}
+  }
+
+  function dispatch(action, value) {
+    const d = { action, value, id: newMsgId() };
+    markSeen(d.id);
+    runCommand(d);                              // 本 frame 立刻响应,不等消息绕一圈
+    if (window.top !== window) sendDown(d);     // 先覆盖自己的子树(万一顶层注入不进去时的兜底)
+    sendUp(d);                                  // 再上送顶层;本身就是顶层时 sendUp 内部即广播
   }
 
   window.addEventListener("message", (e) => {
     const d = e.data;
     if (!d || d.__vsc !== true) return;
-    if (d.action === "rate") {
-      applyLocal(d.value);
-      broadcast(d); // 继续往更深的子 frame 传
-    } else if (d.action === "seek") {
-      seekLocal(d.value);
-      broadcast(d);
+    if (d.dir === "up") {
+      if (window.top === window) {
+        if (!markSeen(d.id)) runCommand(d);
+        sendDown(d);
+      } else {
+        sendUp(d);
+      }
+    } else {
+      if (!markSeen(d.id)) runCommand(d);
+      sendDown(d);
     }
   });
 
-  function changeRate(rate) {
-    applyLocal(rate);
-    broadcast({ action: "rate", value: targetRate });
-  }
-  function seek(delta) {
-    seekLocal(delta);
-    broadcast({ action: "seek", value: delta });
+  /* ------------------------- 键盘 ------------------------- */
+  function keyTarget(e) {
+    // shadow DOM 里的事件到了外层会被重定向成宿主元素,composedPath()[0] 才是真正的落点
+    let deep = null;
+    try { const p = e.composedPath && e.composedPath(); if (p && p.length) deep = p[0]; } catch (_) {}
+    return deep || e.target;
   }
 
-  /* ------------------------- 键盘 ------------------------- */
   function onKeydown(e) {
     if (!settings.enabled) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (isTypingTarget(e.target)) return;
+    if (e.isComposing || e.keyCode === 229) return;   // 输入法组字中
+    if (isTypingTarget(keyTarget(e)) || isTypingTarget(document.activeElement)) return;
 
     const k = settings.keys;
     let handled = true;
     switch (e.code) {
-      case k.faster: changeRate(targetRate + settings.step); break;
-      case k.slower: changeRate(targetRate - settings.step); break;
-      case k.reset: changeRate(1.0); break;
+      case k.faster: dispatch("rate", clamp(round2(targetRate + settings.step))); break;
+      case k.slower: dispatch("rate", clamp(round2(targetRate - settings.step))); break;
+      case k.reset: dispatch("rate", 1.0); break;
       case k.toggleFast:
-        changeRate(Math.abs(targetRate - 1.0) < 0.01 ? settings.fastSpeed : 1.0);
+        dispatch("rate", Math.abs(targetRate - 1.0) < 0.01 ? settings.fastSpeed : 1.0);
         break;
-      case k.rewind: seek(-settings.seekStep); break;
-      case k.forward: seek(settings.seekStep); break;
-      case k.display:
-        pinIndicator = !pinIndicator;
-        showIndicator();
-        break;
+      case k.rewind: dispatch("seek", -settings.seekStep); break;
+      case k.forward: dispatch("seek", settings.seekStep); break;
+      case k.display: dispatch("pin", !pinIndicator); break;
       default: handled = false;
     }
     if (handled) {
@@ -369,21 +539,22 @@
   try {
     chrome.runtime?.onMessage.addListener((msg, _sender, sendResponse) => {
       if (!msg || !msg.__vscCmd) return;
-      if (msg.type === "setRate") {
-        changeRate(msg.value);
+      if (msg.type === "setRate" || msg.type === "seek") {
+        // tabs.sendMessage 会送到每一个 frame。只让顶层当入口、再由它路由到整棵树,
+        // 否则每个 frame 各发一轮 —— 快进会被执行 N 次。
+        if (window.top !== window) return;
+        dispatch(msg.type === "setRate" ? "rate" : "seek", msg.value);
         sendResponse({ ok: true, rate: targetRate });
       } else if (msg.type === "getRate") {
         // 只有含媒体的 frame 才回应,避免空 frame 抢答
         if (media.size > 0) {
-          let r = 1.0;
-          media.forEach((m) => { if (m.playbackRate) r = m.playbackRate; });
+          const best = pickActiveVideo();
+          let r = best ? best.v.playbackRate : 1.0;
+          if (!best) media.forEach((m) => { if (m.playbackRate) r = m.playbackRate; });
           sendResponse({ rate: round2(r), hasMedia: true });
         } else {
           sendResponse({ hasMedia: false });
         }
-      } else if (msg.type === "seek") {
-        seek(msg.value);
-        sendResponse({ ok: true });
       }
       return true;
     });
@@ -392,69 +563,97 @@
   /* ------------------------- 速度提示 UI ------------------------- */
   let indicatorEl = null;
   let hideTimer = null;
+  let popoverTimer = 0;
   let pinRAF = 0;
 
-  // 选出"最该贴提示"的视频:优先正在播放的、其次面积最大且在视口内的
-  function pickActiveVideo() {
-    let best = null, bestScore = -1;
-    media.forEach((v) => {
-      if (v.tagName !== "VIDEO") return;
-      let rect;
-      try { rect = v.getBoundingClientRect(); } catch (_) { return; }
-      if (rect.width < 2 || rect.height < 2) return;
-      const vw = window.innerWidth, vh = window.innerHeight;
-      const inView = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
-      let score = rect.width * rect.height;
-      if (!v.paused) score += 1e12;
-      if (inView) score += 1e9;
-      if (score > bestScore) { bestScore = score; best = { v, rect }; }
-    });
-    return best;
-  }
+  /* 浏览器支持 popover 时把提示放进 top layer:
+   * 这样即使 <video> 自己进入全屏(全屏时页面其余内容根本不参与渲染),提示依然看得见;
+   * 顺带也不再怕站点祖先元素上的 transform/filter/overflow 把 position:fixed 圈住。 */
+  const POPOVER_OK = (() => {
+    try {
+      return typeof HTMLElement !== "undefined" &&
+        Object.prototype.hasOwnProperty.call(HTMLElement.prototype, "popover");
+    } catch (_) { return false; }
+  })();
 
   function ensureIndicator(host) {
     if (!indicatorEl) {
       indicatorEl = document.createElement("div");
       indicatorEl.className = "__vsc-indicator";
+      if (POPOVER_OK) { try { indicatorEl.setAttribute("popover", "manual"); } catch (_) {} }
     }
     host = host || document.body || document.documentElement;
     if (host && indicatorEl.parentNode !== host) host.appendChild(indicatorEl);
     return indicatorEl;
   }
 
+  function popoverOpen() {
+    try { return !!indicatorEl && indicatorEl.matches(":popover-open"); } catch (_) { return false; }
+  }
+  /* restack=true:重新往 top layer 里插一次。
+   * top layer 按加入顺序叠放,视频是在提示之后才进的全屏,不重插就会被全屏层盖住。 */
+  function openIndicator(restack) {
+    if (!POPOVER_OK || !indicatorEl || !indicatorEl.isConnected) return;
+    try {
+      if (popoverOpen()) {
+        if (!restack) return;
+        indicatorEl.hidePopover();
+      }
+      indicatorEl.showPopover();
+    } catch (_) {}
+  }
+  function closeIndicator() {
+    if (!POPOVER_OK || !indicatorEl) return;
+    try { if (popoverOpen()) indicatorEl.hidePopover(); } catch (_) {}
+  }
+
   // 把提示定位到活动视频的左上角(随视频位置走)
   function positionIndicator() {
-    const fsRaw = document.fullscreenElement || document.webkitFullscreenElement;
-    // 全屏元素若是容器,就把提示挂进去(否则会被全屏层遮住);若直接全屏 <video> 则无法叠加
-    const fsHost = fsRaw && fsRaw.tagName !== "VIDEO" && fsRaw.tagName !== "AUDIO" ? fsRaw : null;
+    const fsRaw = fullscreenEl();
+    // 不支持 popover 时的老办法:全屏元素若是容器就把提示挂进去;
+    // 直接全屏 <video> 则无处可挂(这正是 popover 要解决的那种情况)。
+    const fsHost = !POPOVER_OK && fsRaw && !isMedia(fsRaw) ? fsRaw : null;
     const target = pickActiveVideo();
+    ensureIndicator(fsHost || document.body || document.documentElement);
+    if (!indicatorEl) return;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let left = 14, top = 14;
     if (target) {
-      ensureIndicator(fsHost || document.body || document.documentElement);
       const r = target.rect;
-      indicatorEl.style.left = (Math.max(0, r.left) + 10) + "px";
-      indicatorEl.style.top = (Math.max(0, r.top) + 10) + "px";
-    } else {
-      // 没有可定位的视频(纯音频等):回退到页面左上角
-      ensureIndicator(document.body || document.documentElement);
-      indicatorEl.style.left = "14px";
-      indicatorEl.style.top = "14px";
+      left = Math.max(0, r.left) + 10;
+      top = Math.max(0, r.top) + 10;
     }
+    // 视频滚出视口时别把提示甩到屏幕外
+    indicatorEl.style.left = Math.max(0, Math.min(left, vw - 60)) + "px";
+    indicatorEl.style.top = Math.max(0, Math.min(top, vh - 40)) + "px";
   }
 
   function showIndicator(text) {
     if (!settings.showIndicator) return;
-    if (media.size === 0 && !pinIndicator) return; // 没媒体的 frame 不闪
+    if (media.size === 0) return; // 没媒体的 frame 一律不显示,常驻模式下也不显示
+                                  // (否则页面里每个空 iframe 都会挂一个角标)
+    if (popoverTimer) { clearTimeout(popoverTimer); popoverTimer = 0; }
     positionIndicator();
     if (!indicatorEl) return;
+    openIndicator(false);
     indicatorEl.textContent = text || `${round2(targetRate)}x`;
     indicatorEl.classList.add("__vsc-show");
-    if (hideTimer) clearTimeout(hideTimer);
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
     if (pinIndicator) {
       startPinTracking();
     } else {
       stopPinTracking();
-      hideTimer = setTimeout(() => indicatorEl.classList.remove("__vsc-show"), 1400);
+      hideTimer = setTimeout(hideIndicator, 1400);
     }
+  }
+
+  function hideIndicator() {
+    stopPinTracking();
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    if (!indicatorEl) return;
+    indicatorEl.classList.remove("__vsc-show");
+    if (popoverTimer) clearTimeout(popoverTimer);
+    popoverTimer = setTimeout(() => { popoverTimer = 0; closeIndicator(); }, 260); // 等淡出动画走完
   }
 
   // 常驻模式下持续跟随视频位置(滚动/全屏切换/布局变化)
@@ -471,17 +670,26 @@
     if (pinRAF) { cancelAnimationFrame(pinRAF); pinRAF = 0; }
   }
 
-  document.addEventListener("fullscreenchange", () => { if (indicatorEl) positionIndicator(); });
-  document.addEventListener("webkitfullscreenchange", () => { if (indicatorEl) positionIndicator(); });
+  function onFullscreenChange() {
+    rescan();                       // 有些播放器进全屏时会重建 <video>
+    if (!indicatorEl) return;
+    positionIndicator();
+    // 重新加入 top layer,否则会被刚进全屏的元素压在下面
+    if (indicatorEl.classList.contains("__vsc-show")) openIndicator(true);
+  }
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", onFullscreenChange);
 
   /* ------------------------- 启动 ------------------------- */
   refreshAutoMute(); // 先用默认配置判定,缩短"有声"窗口;storage 读完后再校正
   loadSettings();
   startObserver();
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => scan(document), { once: true });
+    document.addEventListener("DOMContentLoaded", () => rescan(), { once: true });
   }
   scan(document);
   // 兜底:延迟再扫几次,catch 晚加载的播放器和后挂上的 shadow root
-  [500, 1500, 4000].forEach((ms) => setTimeout(() => scan(document), ms));
+  [500, 1500, 4000, 8000].forEach((ms) => setTimeout(rescan, ms));
+  // 切回前台时补一次:站点常在标签页被看到时才真正建播放器
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) rescan(); });
 })();

@@ -54,11 +54,29 @@ async function refreshCurrentRate() {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       func: () => {
-        const v = document.querySelector("video, audio");
-        return v ? v.playbackRate : null;
+        // 挑"当前那个"视频,而不是第一个:页面上常常先躺着几个隐藏的预览/广告 <video>,
+        // 取第一个会读到它们的速度(通常是 1x),显示得驴唇不对马嘴。
+        const list = [...document.querySelectorAll("video, audio")];
+        if (!list.length) return null;
+        const fs = document.fullscreenElement;
+        let best = null, bestScore = -1;
+        for (const v of list) {
+          const r = v.getBoundingClientRect();
+          let score = Math.max(0, r.width) * Math.max(0, r.height);
+          if (fs && (v === fs || fs.contains(v))) score += 1e15;
+          if (!v.paused) score += 1e12;
+          if (r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth) score += 1e9;
+          if (score > bestScore) { bestScore = score; best = v; }
+        }
+        return best ? { rate: best.playbackRate, score: bestScore } : null;
       }
     });
-    const rate = results.map((r) => r.result).find((r) => r != null);
+    // 各 frame 都会返回一个候选,取分数最高的那个 frame 的结果
+    const best = results
+      .map((r) => r.result)
+      .filter((r) => r && typeof r.rate === "number")
+      .sort((a, b) => b.score - a.score)[0];
+    const rate = best ? best.rate : null;
     if (rate != null) {
       $("curRate").textContent = (Math.round(rate * 100) / 100) + "x";
       $("rateInput").value = Math.round(rate * 100) / 100;
@@ -89,7 +107,12 @@ async function setRate(rate) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: true },
-        func: (r) => { document.querySelectorAll("video, audio").forEach((v) => v.playbackRate = r); },
+        // defaultPlaybackRate 也要写:只改 playbackRate 的话,站点一换 src 就被静默清回去了
+        func: (r) => {
+          document.querySelectorAll("video, audio").forEach((v) => {
+            try { v.defaultPlaybackRate = r; v.playbackRate = r; } catch (_) {}
+          });
+        },
         args: [rate]
       });
     } catch (_) {}

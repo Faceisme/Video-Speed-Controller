@@ -1,7 +1,23 @@
+/* 速度提示。
+ * 元素上会带 popover="manual"(支持的浏览器),渲染在 top layer:
+ *   · <video> 自己全屏时也能盖在上面(全屏状态下普通页面内容根本不参与渲染)
+ *   · 不受站点祖先元素 transform / filter / overflow 的影响
+ * 下面这批 !important 之外的属性,是用来盖掉浏览器给 [popover] 的默认样式
+ * (inset:0 / margin:auto / border:solid / padding / background:Canvas …)。
+ * 注意:绝对不要在这里写 display —— 那会盖掉 UA 的
+ * `[popover]:not(:popover-open){display:none}`,提示就再也藏不住了。
+ */
 .__vsc-indicator {
   position: fixed;
   top: 14px;
   left: 14px;
+  right: auto;
+  bottom: auto;
+  width: auto;
+  height: auto;
+  margin: 0;
+  border: 0;
+  overflow: visible;
   z-index: 2147483647;
   padding: 6px 12px;
   border-radius: 8px;
