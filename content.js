@@ -22,6 +22,7 @@
     maxSpeed: 16,
     rememberSpeed: false, // 记住上次速度并自动套用到新视频
     showIndicator: true,
+    clickToggle: true,    // 单击视频画面播放/暂停
     autoMute: true,                  // 命中下面的域名时自动静音
     autoMuteHosts: ["115vod.com"],   // 需要自动静音的域名(支持子域)
     keys: {
@@ -535,6 +536,152 @@
   }
   window.addEventListener("keydown", onKeydown, true);
 
+  /* ------------------------- 点击画面播放/暂停 -------------------------
+   * 很多自定义播放器点画面没反应,非得去点那个小小的播放键。这里补上:单击画面切换播放/暂停。
+   * 难点是别跟站点自己的"点击切换"打架(一次点击被切两次 = 看起来没反应):
+   *   · pointerdown 时先记下视频当时的 paused;
+   *   · click 之后稍等一下(给站点的同步处理器、微任务、rAF 里的切换留出时间),
+   *     状态已经变了 → 站点自己处理了,什么都不做;没变 → 由我们来切。
+   *   · 有的播放器为了区分双击,单击要延迟 200~300ms 才切。这时我们先切了、站点随后又
+   *     切回去 —— 看到"没有新的输入却被翻了回去",就再切一次把这次点击的本意补回来,
+   *     并记住本 frame 的站点会自己处理,之后不再插手。
+   * 只认画面本身,或者盖在画面上的大面积遮罩层;点到按钮、链接、进度条、菜单这些控件不管。
+   * 带原生 controls 的 <video> 也要接手:Chrome 只有在视频已经加载出数据后才会自己"点画面切换",
+   * preload="none" 还没加载的(DMM 系的样片站就是这样)点画面毫无反应。Chrome 自己切了的话,
+   * 上面那条"状态已经变了就不管"会让路。原生控件条上的点击(进度条、静音、⋮)实测页面根本
+   * 收不到 click;底部那一溜仍按位置排除兜底(比如播放中控件条自动隐藏时点下去)。
+   */
+  const CLICK_DECIDE_MS = 60;    // click 之后等这么久再看站点有没有自己切
+  const CLICK_WATCH_MS = 600;    // 我们切完之后这段时间里被翻回去 = 站点也在切(延迟单击)
+  const CLICK_MAX_MS = 600;      // 按下到松开超过这么久算长按,不算单击
+  const CLICK_SLOP_PX = 6;       // 按下到松开移动超过这么多算拖动
+  const NATIVE_BAR_PX = 80;      // 原生控件条(按钮行 + 进度条)的高度,Chrome 实测约 72px,略放宽
+  const CONTROL_SEL = [
+    "button", "input", "select", "textarea", "label", "summary",
+    "[contenteditable]:not([contenteditable='false'])",
+    "[role='button']", "[role='link']", "[role='slider']", "[role='scrollbar']",
+    "[role='progressbar']", "[role='menu']", "[role='menuitem']", "[role='menuitemradio']",
+    "[role='menuitemcheckbox']", "[role='checkbox']", "[role='radio']", "[role='switch']",
+    "[role='tab']", "[role='option']", "[role='listbox']", "[role='combobox']", "[role='textbox']"
+  ].join(",");
+
+  let siteTogglesOnClick = false; // 本 frame 的站点已被证实会自己处理点击切换
+  let pendingPress = null;        // 最近一次落在视频上的 pointerdown:{ v, paused, x, y, t }
+  let decideTimer = 0;            // 还没到点的那次判定
+  let lastInputAt = 0;           // 最近一次用户输入,用来区分"站点翻回去"和"用户自己又操作了"
+
+  // 点下去的位置对应哪个视频:事件路径里有 <video> 就是它,否则按坐标找(多个重叠取面积最小的)
+  function videoAtPoint(e) {
+    let path = [];
+    try { path = e.composedPath(); } catch (_) {}
+    for (const n of path) {
+      if (n && n.tagName === "VIDEO") { if (!media.has(n)) register(n); return n; }
+    }
+    let best = null, bestArea = Infinity;
+    media.forEach((v) => {
+      if (v.tagName !== "VIDEO") return;
+      let r;
+      try { r = v.getBoundingClientRect(); } catch (_) { return; }
+      if (r.width < 2 || r.height < 2) return;
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
+      const area = r.width * r.height;
+      if (area < bestArea) { bestArea = area; best = v; }
+    });
+    return best;
+  }
+
+  // 点在原生控件条那一溜上了吗
+  function onNativeBar(e, v) {
+    try { return e.clientY > v.getBoundingClientRect().bottom - NATIVE_BAR_PX; } catch (_) { return true; }
+  }
+
+  // 这次点击算不算"点在画面上"
+  function clickOnPicture(e, v) {
+    if (v.controls && onNativeBar(e, v)) return false;
+    if (v.loop && v.muted && !mutedByUs.has(v)) return false;  // 背景视频 / 动图式视频
+    let path = [];
+    try { path = e.composedPath(); } catch (_) {}
+    if (!path.length) return false;
+    // 套在链接里的(缩略图悬停预览之类),点下去是要跳转的
+    for (const n of path) {
+      try { if (n.nodeType === 1 && n.matches("a[href]")) return false; } catch (_) {}
+    }
+    // 视频的祖先链(跨 shadow 边界)。事件路径走到这条链上就出了"盖在画面上的那一层",
+    // 再往上是整个播放器/页面的容器,不归控件判断管(否则放在弹窗、卡片里的播放器全被误杀)
+    const anc = new Set();
+    for (let n = v; n; n = n.parentNode || n.host) anc.add(n);
+    for (const n of path) {
+      if (n === v) return true;                                // 直接点在 <video> 上
+      if (anc.has(n)) break;
+      try { if (n.nodeType === 1 && n.matches(CONTROL_SEL)) return false; } catch (_) {}
+    }
+    // 点在遮罩层上:最深的那个元素得盖住画面的一大半才算 ——
+    // 进度条、控件条、标题文字这些小东西不算
+    const t = path[0];
+    if (!t || t.nodeType !== 1) return false;
+    let tr, vr;
+    try { tr = t.getBoundingClientRect(); vr = v.getBoundingClientRect(); } catch (_) { return false; }
+    const w = Math.min(tr.right, vr.right) - Math.max(tr.left, vr.left);
+    const h = Math.min(tr.bottom, vr.bottom) - Math.max(tr.top, vr.top);
+    return w > 0 && h > 0 && (w * h) / (vr.width * vr.height) >= 0.4;
+  }
+
+  function setPlaying(v, play) {
+    try {
+      if (play) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+      else v.pause();
+    } catch (_) {}
+    showIndicator(play ? "▶ 播放" : "⏸ 暂停");
+  }
+
+  function decideClickToggle(press) {
+    const v = press.v;
+    if (siteTogglesOnClick || !v.isConnected) return;
+    if (v.paused !== press.paused) return;                     // 站点自己切过了
+    const play = v.paused;
+    const at = Date.now();
+    setPlaying(v, play);
+    // 盯一会儿:没有新的输入却被翻回去,说明站点也在切(只是比我们晚)
+    let timer = 0;
+    const onFlip = () => {
+      if (lastInputAt > at) { stop(); return; }                // 用户自己又操作了,不算
+      if (v.paused === !play) return;                          // 我们自己那次切换派发的事件
+      stop();
+      siteTogglesOnClick = true;
+      setPlaying(v, play);                                     // 把这次点击的本意补回来
+    };
+    const stop = () => {
+      clearTimeout(timer);
+      v.removeEventListener("play", onFlip);
+      v.removeEventListener("pause", onFlip);
+    };
+    v.addEventListener("play", onFlip);
+    v.addEventListener("pause", onFlip);
+    timer = setTimeout(stop, CLICK_WATCH_MS);
+  }
+
+  window.addEventListener("keydown", () => { lastInputAt = Date.now(); }, true);
+  window.addEventListener("pointerdown", (e) => {
+    lastInputAt = Date.now();
+    pendingPress = null;
+    // 上一次单击还没判定就又按下了 = 双击(多半是要全屏):两下都不算,播放状态不动
+    if (decideTimer) { clearTimeout(decideTimer); decideTimer = 0; return; }
+    if (!settings.clickToggle || siteTogglesOnClick || media.size === 0) return;
+    if (!e.isTrusted || e.button !== 0) return;
+    if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+    const v = videoAtPoint(e);
+    if (v) pendingPress = { v, paused: v.paused, x: e.clientX, y: e.clientY, t: Date.now() };
+  }, true);
+  window.addEventListener("click", (e) => {
+    const press = pendingPress;
+    pendingPress = null;
+    if (!press || !e.isTrusted || e.button !== 0) return;
+    if (Date.now() - press.t > CLICK_MAX_MS) return;
+    if (Math.abs(e.clientX - press.x) > CLICK_SLOP_PX || Math.abs(e.clientY - press.y) > CLICK_SLOP_PX) return;
+    if (!clickOnPicture(e, press.v)) return;
+    decideTimer = setTimeout(() => { decideTimer = 0; decideClickToggle(press); }, CLICK_DECIDE_MS);
+  }, true);
+
   /* ------------------------- popup 消息(设置/读取速度) ------------------------- */
   try {
     chrome.runtime?.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -641,6 +788,8 @@
     if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
     if (pinIndicator) {
       startPinTracking();
+      // 常驻模式下临时文字("▶ 播放""⏩ +5s")过一会儿换回速度,别一直挂着
+      if (text) hideTimer = setTimeout(() => { hideTimer = null; showIndicator(); }, 1400);
     } else {
       stopPinTracking();
       hideTimer = setTimeout(hideIndicator, 1400);

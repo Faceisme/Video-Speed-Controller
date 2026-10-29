@@ -9,6 +9,7 @@ const DEFAULTS = {
   maxSpeed: 16,
   rememberSpeed: false,
   showIndicator: true,
+  clickToggle: true,
   autoMute: true,
   autoMuteHosts: ["115vod.com"],
   keys: {
@@ -207,6 +208,7 @@ function render() {
   $("seekStep").value = settings.seekStep;
   $("rememberSpeed").checked = settings.rememberSpeed;
   $("showIndicator").checked = settings.showIndicator;
+  $("clickToggle").checked = settings.clickToggle;
   $("autoMute").checked = settings.autoMute;
   $("autoMuteHosts").value = (settings.autoMuteHosts || []).join("\n");
   document.querySelectorAll("[data-key]").forEach((inp) => {
@@ -233,6 +235,7 @@ function bind() {
   $("enabled").addEventListener("change", (e) => { settings.enabled = e.target.checked; save(); });
   $("rememberSpeed").addEventListener("change", (e) => { settings.rememberSpeed = e.target.checked; save(); });
   $("showIndicator").addEventListener("change", (e) => { settings.showIndicator = e.target.checked; save(); });
+  $("clickToggle").addEventListener("change", (e) => { settings.clickToggle = e.target.checked; save(); });
   $("autoMute").addEventListener("change", (e) => { settings.autoMute = e.target.checked; save(); });
   $("autoMuteHosts").addEventListener("change", (e) => {
     settings.autoMuteHosts = e.target.value
